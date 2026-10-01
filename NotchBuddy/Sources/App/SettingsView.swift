@@ -4,7 +4,7 @@ import AppKit
 
 struct SettingsView: View {
     @ObservedObject private var state = AppState.shared
-    @State private var apiKey: String = KeychainStore.shared.get("anthropic-api-key") ?? ""
+    @State private var apiKey: String = KeychainStore.shared.get("hermes-api-key") ?? ""
     @State private var launchAtStartup: Bool = (SMAppService.mainApp.status == .enabled)
     @State private var statusMessage: String = ""
     @State private var showDiff: Bool = false
@@ -49,10 +49,10 @@ struct SettingsView: View {
                 // MARK: API
                 GroupBox("Anthropic API") {
                     VStack(alignment: .leading, spacing: 8) {
-                        SecureField("API key (sk-ant-…)", text: $apiKey)
+                        SecureField("Hermes API_SERVER_KEY", text: $apiKey)
                             .textFieldStyle(.roundedBorder)
                         Button("Save") {
-                            KeychainStore.shared.set("anthropic-api-key", value: apiKey)
+                            KeychainStore.shared.set("hermes-api-key", value: apiKey)
                             statusMessage = "✓ Key saved."
                         }
                         .buttonStyle(.borderedProminent)
@@ -61,7 +61,7 @@ struct SettingsView: View {
                 }
 
                 // MARK: Hooks
-                GroupBox("Claude Code Hooks") {
+                GroupBox("Hermes Hooks") {
                     VStack(alignment: .leading, spacing: 10) {
                         if hookNeedsUpdate {
                             HStack(spacing: 6) {
@@ -262,7 +262,7 @@ struct SettingsView: View {
                 GroupBox("Active pills") {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack {
-                            Text("VS Code")
+                            Text("Hermes")
                                 .font(.system(size: 12, weight: .semibold))
                             Circle().fill(Color(hex: "#F5F6F8")).frame(width: 8, height: 8)
                             Spacer()
@@ -391,7 +391,7 @@ struct SettingsView: View {
         do {
             try HookServer.shared.installAndWriteClaudeHooksAppStore(claudeURL: claudeURL)
             hookNeedsUpdate = false
-            statusMessage = "✓ Hooks installed — restart VS Code to activate."
+            statusMessage = "✓ Hooks installed — restart Hermes to activate."
         } catch {
             statusMessage = "❌ \(error.localizedDescription)"
         }

@@ -1,0 +1,5 @@
+name: coucou-approval
+version: 1.0.0
+description: "Routes Hermes dangerous-command approvals to the Coucou notch companion."
+author: "pablo"
+kind: standalone

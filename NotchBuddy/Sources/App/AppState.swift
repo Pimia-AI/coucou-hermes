@@ -4,24 +4,61 @@ import Combine
 
 // Integration pills — always-present, never purged
 extension AgentTask {
-    /// All available integration pills. Claude is always active; others are opt-in (max 4).
+    /// The only permanent pill: the Hermes main session. Subagents are added and
+    /// removed at runtime by HookServer as they spawn and finish, so this list
+    /// deliberately no longer carries the upstream SaaS integrations.
+    /// The id stays `integration_claude` because ~15 call sites key off it; only
+    /// what the user sees changed.
     static let integrationAgents: [AgentTask] = [
-        AgentTask(id: "integration_claude",  name: "VS Code",   color: "#F5F6F8", state: .idle, steps: [], source: .claudeCode, isIntegration: true),
-        AgentTask(id: "integration_resend",  name: "Resend",    color: "#22C55E", state: .idle, steps: [], source: .n8n, isIntegration: true),
-        AgentTask(id: "integration_n8n",     name: "n8n",       color: "#F29B38", state: .idle, steps: [], source: .n8n, isIntegration: true),
-        AgentTask(id: "integration_vercel",  name: "Vercel",    color: "#7C5CFF", state: .idle, steps: [], source: .n8n, isIntegration: true),
-        AgentTask(id: "integration_github",  name: "GitHub",    color: "#F4505E", state: .idle, steps: [], source: .n8n, isIntegration: true),
-        AgentTask(id: "integration_notion",  name: "Notion",    color: "#8C8C8C", state: .idle, steps: [], source: .n8n, isIntegration: true),
-        AgentTask(id: "integration_calcom",  name: "Cal.com",   color: "#C9956A", state: .idle, steps: [], source: .n8n, isIntegration: true),
-        AgentTask(id: "integration_stripe",  name: "Stripe",    color: "#0570DE", state: .idle, steps: [], source: .n8n, isIntegration: true),
+        AgentTask(id: "integration_claude",  name: "Hermes",    color: "#F5F6F8", state: .idle, steps: [], source: .claudeCode, isIntegration: true),
     ]
 
-    /// IDs that can be toggled (VS Code is always on and excluded from this list)
-    static let toggleableIntegrationIds: [String] = [
-        "integration_resend", "integration_n8n", "integration_vercel", "integration_github",
-        "integration_notion", "integration_calcom", "integration_stripe",
-    ]
+    /// Nothing is toggleable any more: the other three grid slots belong to live
+    /// subagents, which come and go on their own.
+    static let toggleableIntegrationIds: [String] = []
 
+    /// Pill id for one live Hermes subagent.
+    static func hermesSubagentId(_ subagentId: String) -> String { "hermes_\(subagentId)" }
+
+    /// Pill id for one Hermes profile ("bot"). The default profile keeps the
+    /// legacy `integration_claude` id — ~15 call sites key off it.
+    static func hermesBotId(_ profile: String) -> String {
+        profile == "default" ? "integration_claude" : "hermes_bot_\(profile)"
+    }
+
+    /// Persistent pills for the secondary Hermes profiles, i.e. everything the
+    /// Hermes desktop lists under BOTS except `default`, which is the main pill.
+    /// Read from disk rather than from the gateway: a stopped bot still has a
+    /// profile directory but serves no API to ask.
+    static func hermesBotAgents() -> [AgentTask] {
+        let dir = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent(".hermes/profiles")
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
+        return names.filter { !$0.hasPrefix(".") }.sorted().map { profile in
+            AgentTask(
+                id: hermesBotId(profile),
+                name: prettyBotName(profile),
+                color: hermesColor(for: profile),
+                state: .idle, steps: [], source: .claudeCode, isIntegration: true
+            )
+        }
+    }
+
+    /// "pepe-bot" -> "Pepe Bot", matching how the Hermes desktop labels them.
+    static func prettyBotName(_ profile: String) -> String {
+        profile.split(whereSeparator: { $0 == "-" || $0 == "_" })
+            .map { $0.prefix(1).uppercased() + $0.dropFirst() }
+            .joined(separator: " ")
+    }
+
+    /// Deterministic colour per subagent, so the same child keeps its colour for
+    /// its whole life and two concurrent children are easy to tell apart.
+    static func hermesColor(for subagentId: String) -> String {
+        let palette = ["#22C55E", "#F29B38", "#7C5CFF", "#F4505E", "#0570DE", "#C9956A"]
+        var hash: UInt64 = 5381
+        for byte in subagentId.utf8 { hash = (hash &* 33) &+ UInt64(byte) }
+        return palette[Int(hash % UInt64(palette.count))]
+    }
 }
 
 @MainActor
@@ -135,8 +172,9 @@ final class AppState: ObservableObject {
         }
     }
 
-    // Active integration pills (VS Code excluded — always on). Max 4.
-    @Published var activeIntegrations: Set<String> = ["integration_resend", "integration_n8n", "integration_vercel", "integration_github"] {
+    // Empty by design: the grid's other slots now hold live Hermes subagents,
+    // which HookServer adds and removes itself.
+    @Published var activeIntegrations: Set<String> = [] {
         didSet {
             if let data = try? JSONEncoder().encode(Array(activeIntegrations)) {
                 UserDefaults.standard.set(data, forKey: "activeIntegrations")
@@ -201,8 +239,14 @@ final class AppState: ObservableObject {
            let a = try? JSONDecoder().decode([String].self, from: d) { vercelProjectFilter = Set(a) }
         if let d = ud.data(forKey: "n8nWorkflowFilter"),
            let a = try? JSONDecoder().decode([String].self, from: d) { n8nWorkflowFilter = Set(a) }
+        // Drop ids saved by an upstream build whose pills no longer exist here,
+        // otherwise a previous install's Stripe/GitHub/... selection survives as
+        // dead entries that "n/4 slots used" would still count.
         if let d = ud.data(forKey: "activeIntegrations"),
-           let a = try? JSONDecoder().decode([String].self, from: d) { activeIntegrations = Set(a) }
+           let a = try? JSONDecoder().decode([String].self, from: d) {
+            let known = Set(AgentTask.integrationAgents.map(\.id))
+            activeIntegrations = Set(a).intersection(known)
+        }
 
         // Sync SoundEngine volume on launch
         SoundEngine.shared.volume = Float(soundVolume)
@@ -266,6 +310,11 @@ final class AppState: ObservableObject {
 
     /// Load integration pills respecting activeIntegrations. VS Code always loads. Safe to call multiple times.
     func loadIntegrationTasks() {
+        // Secondary Hermes profiles are discovered on disk, so they appear even
+        // when their gateway is stopped — the desktop's BOTS list, mirrored.
+        for bot in AgentTask.hermesBotAgents() where !tasks.contains(where: { $0.id == bot.id }) {
+            tasks.append(bot)
+        }
         for task in AgentTask.integrationAgents {
             let shouldLoad = task.id == "integration_claude" || activeIntegrations.contains(task.id)
             let loaded = tasks.contains(where: { $0.id == task.id })

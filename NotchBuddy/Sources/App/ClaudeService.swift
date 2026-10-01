@@ -62,6 +62,7 @@ final class KeychainStore: @unchecked Sendable {
 
     private static let allKeys = [
         "anthropic-api-key",
+        "hermes-api-key",
         "resend-api-key", "resend-from",
         "n8n-url", "n8n-api-key",
         "vercel-token",
@@ -100,19 +101,31 @@ final class KeychainStore: @unchecked Sendable {
     }
 }
 
-// MARK: - Claude API
+// MARK: - Hermes agent service
+//
+// Talks to the local Hermes gateway (gateway/platforms/api_server.py), NOT to
+// api.anthropic.com. The endpoint is OpenAI-compatible but it is not a model
+// proxy: each request drives a real Hermes agent turn, with its toolsets,
+// skills and subagents. Subagents it spawns surface as pills here via the
+// shell-hook bridge in ~/.hermes/coucou-bridge.
+//
+// The key is a full-access credential: that endpoint dispatches terminal-capable
+// work, which is why Hermes refuses to start without a strong one and binds
+// 127.0.0.1 only. It lives in the Keychain like every other secret.
 
 @MainActor
 final class ClaudeService {
     static let shared = ClaudeService()
 
-    private let endpoint = URL(string: "https://api.anthropic.com/v1/messages")!
-    private let anthropicVersion = "2023-06-01"
-    private let model = "claude-sonnet-4-6"
+    private let endpoint = URL(string: "http://127.0.0.1:8642/v1/chat/completions")!
+    private let model = "hermes-agent"
+    /// An agent turn may run tools, search and spawn subagents; the old 45 s
+    /// Anthropic timeout would cut off most real work.
+    private let requestTimeout: TimeInterval = 300
 
-    var apiKey: String? { KeychainStore.shared.get("anthropic-api-key") }
+    var apiKey: String? { KeychainStore.shared.get("hermes-api-key") }
 
-    // Multi-turn conversation messages (for API)
+    // Multi-turn conversation (OpenAI shape: content is a plain string)
     private var conversationMessages: [[String: Any]] = []
 
     func clearConversation() {
@@ -120,85 +133,52 @@ final class ClaudeService {
     }
 
     private let systemPrompt = """
-    You are Mochi, Louis's personal AI assistant embedded in the notch of his Mac. \
-    You have web search access and can help with absolutely anything — research, coding, finding places, recommendations, tasks, questions. \
+    You are Mochi, a personal AI assistant embedded in the notch of this Mac. \
     Respond in the user's language. Be thorough and complete — use as much detail as the task requires. \
     No markdown formatting (no **, no ##, no bullet dashes). Use plain text with line breaks.
     """
 
-    private let webSearchTools: [[String: Any]] = [
-        ["type": "web_search_20250305", "name": "web_search", "max_uses": 5]
-    ]
-
-    // MARK: - Chat (multi-turn, natural text + web search)
+    // MARK: - Chat (multi-turn)
 
     func chat(query: String, context: PromptContext?, state: AppState) async {
         guard let key = apiKey, !key.isEmpty else {
-            await showError("API key missing. Open settings.", state: state)
+            await showError("Hermes key missing. Open settings.", state: state)
             return
         }
 
-        // Build user content for this turn
-        var userContent: [[String: Any]] = []
-
-        // Add file/window context on first message only
+        var parts: [String] = []
+        // Context on the first message only.
         if conversationMessages.isEmpty, let context = context {
-            switch context {
-            case .window(let app, let title, let url):
-                var text = "Context — App: \(app), Window: \(title)"
-                if let url = url { text += ", URL: \(url)" }
-                userContent.append(["type": "text", "text": text])
-            case .file(let name, let fileURL):
-                if let fileURL = fileURL, let block = readFileAsBlock(url: fileURL) {
-                    userContent.append(block)
-                }
-                userContent.append(["type": "text", "text": "File: \(name)"])
-            }
+            parts.append(describe(context))
         }
-        userContent.append(["type": "text", "text": query])
+        parts.append(query)
 
-        conversationMessages.append(["role": "user", "content": userContent])
+        conversationMessages.append(["role": "user", "content": parts.joined(separator: "\n\n")])
 
         let body: [String: Any] = [
             "model": model,
-            "max_tokens": 4096,
-            "tools": webSearchTools,
-            "system": systemPrompt,
-            "messages": conversationMessages,
+            "messages": [["role": "system", "content": systemPrompt]] + conversationMessages,
+            "stream": false,
         ]
 
         do {
-            let data = try await callAPI(body: body, key: key, beta: "web-search-2025-03-05")
+            let data = try await callAPI(body: body, key: key)
             await handleChatResult(data, state: state)
         } catch {
             conversationMessages.removeLast()
-            await showError("Network error: \(error.localizedDescription)", state: state)
+            await showError(friendlyError(error), state: state)
         }
     }
 
-    // MARK: - Structured search (M8 — window attach + web search)
+    // MARK: - Structured search
 
     func search(query: String, context: PromptContext?, state: AppState) async {
         guard let key = apiKey, !key.isEmpty else {
-            await showError("Anthropic API key missing. Open settings to configure it.", state: state)
+            await showError("Hermes key missing. Open settings to configure it.", state: state)
             return
         }
 
-        var userContent: [[String: Any]] = []
-        switch context {
-        case .window(let appName, let title, let url):
-            var text = "App: \(appName)\nWindow title: \(title)"
-            if let url = url { text += "\nURL: \(url)" }
-            text += "\n\nRequest: \(query)"
-            userContent.append(["type": "text", "text": text])
-        case .file(let name, let fileURL):
-            if let fileURL = fileURL, let fileBlock = readFileAsBlock(url: fileURL) {
-                userContent.append(fileBlock)
-            }
-            userContent.append(["type": "text", "text": "File: \(name)\n\nRequest: \(query)"])
-        case nil:
-            userContent.append(["type": "text", "text": query])
-        }
+        let userText = context.map { "\(describe($0))\n\nRequest: \(query)" } ?? query
 
         let system = """
         You are an assistant built into the notch of a Mac. Reply in English, short and precise.
@@ -207,66 +187,96 @@ final class ClaudeService {
         Maximum 3 items. "url" is optional. "note" is optional.
         """
 
-        let tools: [[String: Any]] = [
-            ["type": "web_search_20250305", "name": "web_search", "max_uses": 3]
-        ]
-
         let body: [String: Any] = [
             "model": model,
-            "max_tokens": 1024,
-            "tools": tools,
-            "system": system,
-            "messages": [["role": "user", "content": userContent]],
+            "messages": [
+                ["role": "system", "content": system],
+                ["role": "user", "content": userText],
+            ],
+            "stream": false,
         ]
 
         do {
-            let result = try await callAPI(body: body, key: key, beta: "web-search-2025-03-05")
+            let result = try await callAPI(body: body, key: key)
             await handleResult(result, state: state)
         } catch {
-            await showError("Network error: \(error.localizedDescription)", state: state)
+            await showError(friendlyError(error), state: state)
         }
     }
 
     // MARK: - API call
 
-    private func callAPI(body: [String: Any], key: String, beta: String? = nil) async throws -> Data {
+    private func callAPI(body: [String: Any], key: String) async throws -> Data {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
-        request.setValue(key, forHTTPHeaderField: "x-api-key")
-        request.setValue(anthropicVersion, forHTTPHeaderField: "anthropic-version")
+        request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "content-type")
-        if let beta { request.setValue(beta, forHTTPHeaderField: "anthropic-beta") }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        request.timeoutInterval = 45
+        request.timeoutInterval = requestTimeout
 
         let (data, response) = try await URLSession.shared.data(for: request)
 
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             let msg = String(data: data, encoding: .utf8) ?? "unknown error"
-            throw NSError(domain: "Claude", code: 0, userInfo: [NSLocalizedDescriptionKey: msg])
+            throw NSError(domain: "Hermes", code: status, userInfo: [NSLocalizedDescriptionKey: msg])
         }
         return data
+    }
+
+    /// OpenAI envelope: choices[0].message.content.
+    private func assistantText(_ data: Data) -> String? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let choices = json["choices"] as? [[String: Any]],
+              let message = choices.first?["message"] as? [String: Any],
+              let text = message["content"] as? String,
+              !text.isEmpty else { return nil }
+        return text
+    }
+
+    /// The gateway not running is the one failure worth naming precisely —
+    /// everything else is already a readable message from the server.
+    private func friendlyError(_ error: Error) -> String {
+        let ns = error as NSError
+        if ns.domain == NSURLErrorDomain,
+           ns.code == NSURLErrorCannotConnectToHost || ns.code == NSURLErrorNetworkConnectionLost {
+            return "Hermes gateway not reachable. Start it with: hermes gateway run"
+        }
+        if ns.domain == "Hermes", ns.code == 401 || ns.code == 403 {
+            return "Hermes rejected the key. Check API_SERVER_KEY."
+        }
+        return "Error: \(error.localizedDescription)"
+    }
+
+    // MARK: - Context description
+    //
+    // Files are passed by PATH, not inlined: Hermes runs on this machine and
+    // reads them with its own tools, so there is no base64 round trip and no
+    // 200 KB ceiling — a whole PDF or repo file just works.
+
+    private func describe(_ context: PromptContext) -> String {
+        switch context {
+        case .window(let app, let title, let url):
+            var text = "Context — App: \(app), Window: \(title)"
+            if let url = url { text += ", URL: \(url)" }
+            return text
+        case .file(let name, let fileURL):
+            if let fileURL = fileURL {
+                return "Context — the user attached this file, read it yourself: \(fileURL.path)"
+            }
+            return "Context — file: \(name)"
+        }
     }
 
     // MARK: - Chat result handler
 
     private func handleChatResult(_ data: Data, state: AppState) async {
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let content = json["content"] as? [[String: Any]] else {
-            await showError("Unexpected API response.", state: state)
+        guard let text = assistantText(data) else {
+            await showError("Unexpected gateway response.", state: state)
             return
         }
 
-        // Store full content (includes tool_use/tool_result blocks) for correct multi-turn context
-        conversationMessages.append(["role": "assistant", "content": content])
-
-        guard let textBlock = content.first(where: { $0["type"] as? String == "text" }),
-              let text = textBlock["text"] as? String, !text.isEmpty else {
-            await showError("No response text.", state: state)
-            return
-        }
-
-        // Add to display history
+        conversationMessages.append(["role": "assistant", "content": text])
         state.chatHistory.append(ChatMessage(role: .assistant, content: text.trimmingCharacters(in: .whitespacesAndNewlines)))
 
         state.stateOverride = nil
@@ -277,16 +287,12 @@ final class ClaudeService {
     // MARK: - Structured result handler
 
     private func handleResult(_ data: Data, state: AppState) async {
-        // Extract text from Anthropic response (may contain tool_use / web_search_tool_result blocks)
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let content = json["content"] as? [[String: Any]],
-              let textBlock = content.first(where: { $0["type"] as? String == "text" }),
-              let text = textBlock["text"] as? String else {
-            await showError("Unexpected API response.", state: state)
+        guard let text = assistantText(data) else {
+            await showError("Unexpected gateway response.", state: state)
             return
         }
 
-        // Strip markdown code fences if present, then extract JSON object
+        // Strip markdown code fences if present, then extract the JSON object
         let cleanText: String
         if let start = text.firstIndex(of: "{"), let end = text.lastIndex(of: "}") {
             cleanText = String(text[start...end])
@@ -294,7 +300,6 @@ final class ClaudeService {
             cleanText = text
         }
 
-        // Try to parse as our JSON format
         if let resultData = cleanText.data(using: .utf8),
            let parsed = try? JSONSerialization.jsonObject(with: resultData) as? [String: Any] {
             let title  = parsed["title"] as? String ?? "Result"
@@ -311,10 +316,9 @@ final class ClaudeService {
             }
             state.searchResult = SearchResult(title: title, items: items, note: note)
         } else {
-            // Fallback: show raw text in 3-line chunks
             let lines = cleanText.components(separatedBy: "\n").filter { !$0.isEmpty }.prefix(3)
             state.searchResult = SearchResult(
-                title: "Claude's response",
+                title: "Hermes' response",
                 items: lines.map { ResultItem(label: $0, detail: "", url: nil) },
                 note: nil
             )
@@ -329,30 +333,5 @@ final class ClaudeService {
         state.stateOverride = .error
         state.noteMessage = message
         state.view = .note
-    }
-
-    // MARK: - File content block builder
-
-    private func readFileAsBlock(url: URL) -> [String: Any]? {
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        let ext = url.pathExtension.lowercased()
-        let base64 = data.base64EncodedString()
-
-        if ext == "pdf" {
-            return ["type": "document", "source": ["type": "base64", "media_type": "application/pdf", "data": base64]]
-        } else if ["jpg", "jpeg"].contains(ext) {
-            return ["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": base64]]
-        } else if ext == "png" {
-            return ["type": "image", "source": ["type": "base64", "media_type": "image/png", "data": base64]]
-        } else if ext == "gif" {
-            return ["type": "image", "source": ["type": "base64", "media_type": "image/gif", "data": base64]]
-        } else if ext == "webp" {
-            return ["type": "image", "source": ["type": "base64", "media_type": "image/webp", "data": base64]]
-        } else {
-            // Text/code — inline as text if <= 200 KB
-            guard data.count <= 200_000,
-                  let text = String(data: data, encoding: .utf8) else { return nil }
-            return ["type": "text", "text": "File contents:\n\(text)"]
-        }
     }
 }

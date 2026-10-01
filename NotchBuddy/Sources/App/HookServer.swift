@@ -32,6 +32,9 @@ final class HookServer: @unchecked Sendable {
     private static let maxPayload = 1_048_576          // 1 MB — reject oversized messages
     private static let receiveTimeoutSeconds: Int = 5   // SO_RCVTIMEO on client sockets
     private static let maxConnections = 32              // concurrent connection ceiling
+    // The overview grid renders `others.prefix(4)` — four pills besides the
+    // focused one — so four live subagents is exactly what fits.
+    static let maxSubagentPills = 4
 
     private var serverFD: Int32 = -1
     private let connectionLock = NSLock()
@@ -162,7 +165,10 @@ final class HookServer: @unchecked Sendable {
         let sessionId = payload["session_id"] as? String ?? "unknown"
         let cwd = payload["cwd"] as? String ?? ""
         let rawName = URL(fileURLWithPath: cwd).lastPathComponent
-        let projectName = aliasProjectName(rawName.isEmpty ? "Session" : rawName)
+        // Gateway-driven turns run from the Hermes home, whose basename
+        // (".hermes") is noise as a project name — fall back to the agent.
+        let projectName = rawName.isEmpty || rawName.hasPrefix(".")
+            ? "Hermes" : aliasProjectName(rawName)
 
         let termProgram = payload["term_program"] as? String ?? ""
         let bundleId    = payload["bundle_id"]    as? String ?? ""
@@ -173,12 +179,34 @@ final class HookServer: @unchecked Sendable {
             return
         }
 
-        let focused = state.focusId == "integration_claude"
+        // Which pill this event belongs to. The bridge stamps a subagent's own
+        // events with `subagent_id`; everything else is the main session. An id
+        // for a pill that has already been removed falls back to the main pill
+        // rather than silently dropping the step.
+        // Start at the bot (Hermes profile) the event came from, then narrow to
+        // the subagent pill when one exists. Hermes stamps every hook payload
+        // with its profile, so no lookup is needed to tell the bots apart.
+        var taskId = "integration_claude"
+        if let profile = payload["profile"] as? String, !profile.isEmpty {
+            let botId = AgentTask.hermesBotId(profile)
+            if state.tasks.contains(where: { $0.id == botId }) { taskId = botId }
+        }
+        if let sub = payload["subagent_id"] as? String, !sub.isEmpty {
+            let candidate = AgentTask.hermesSubagentId(sub)
+            if state.tasks.contains(where: { $0.id == candidate }) { taskId = candidate }
+        }
+
+        let focused = state.focusId == taskId
 
         switch name {
 
         case "SessionStart":
-            activeSessionId = sessionId
+            // A subagent starts its own session. Its pill already exists (created
+            // by SubagentStart), so the main-session ceremony — rename, sound,
+            // island expand — must not fire again for every child that spawns.
+            if !taskId.hasPrefix("hermes_") || taskId.hasPrefix("hermes_bot_") {
+                activeSessionId = sessionId
+            } else { break }
             upsertTask(projectName: projectName, cwd: cwd)
             nbLog("SessionStart \(projectName) (\(sessionId.prefix(8)))")
             if state.isPresent { expandIfNeeded(to: .overview) }
@@ -187,79 +215,131 @@ final class HookServer: @unchecked Sendable {
         case "UserPromptSubmit":
             activeSessionId = sessionId
             upsertTask(projectName: projectName, cwd: cwd)
-            state.updateTask(id: "integration_claude", state: .thinking)
+            state.updateTask(id: taskId, state: .thinking)
             if let prompt = payload["prompt"] as? String, !prompt.isEmpty {
-                appendStep(id: "integration_claude", step: String(prompt.prefix(60)))
+                appendStep(id: taskId, step: String(prompt.prefix(60)))
             }
             if state.isPresent { expandIfNeeded(to: .overview) }
 
         case "PreToolUse":
             activeSessionId = sessionId
             upsertTask(projectName: projectName, cwd: cwd)
-            state.updateTask(id: "integration_claude", state: .working)
+            state.updateTask(id: taskId, state: .working)
             let tool = payload["tool_name"] as? String ?? "Tool"
             let input = payload["tool_input"] as? [String: Any] ?? [:]
             let step = frenchStep(tool: tool, input: input)
-            appendStep(id: "integration_claude", step: step)
-            nbLog("PreToolUse \(tool)")
+            appendStep(id: taskId, step: step)
+            nbLog("PreToolUse \(tool) → \(taskId)")
 
         case "PostToolUse":
-            state.updateTask(id: "integration_claude", state: .working)
+            state.updateTask(id: taskId, state: .working)
 
         case "PostToolUseFailure":
-            state.updateTask(id: "integration_claude", state: .working)
-            appendStep(id: "integration_claude", step: "⚠ failed")
+            state.updateTask(id: taskId, state: .working)
+            appendStep(id: taskId, step: "⚠ failed")
 
         case "Notification":
             let message = payload["message"] as? String ?? ""
             let lower = message.lowercased()
             if lower.contains("rate limit") || lower.contains("limite d") {
-                state.updateTask(id: "integration_claude", state: .ratelimit)
+                state.updateTask(id: taskId, state: .ratelimit)
                 SoundEngine.shared.play("rate")
             } else if message.hasSuffix("?") {
-                state.updateTask(id: "integration_claude", state: .question)
-                appendStep(id: "integration_claude", step: message)
+                state.updateTask(id: taskId, state: .question)
+                appendStep(id: taskId, step: message)
             }
 
         case "Stop":
-            state.updateTask(id: "integration_claude", state: .finished)
+            state.updateTask(id: taskId, state: .finished)
             if let message = payload["message"] as? String, !message.isEmpty {
-                appendStep(id: "integration_claude", step: String(message.prefix(60)))
+                appendStep(id: taskId, step: String(message.prefix(60)))
             }
             SoundEngine.shared.play("finish")
             if focused {
                 expandIfNeeded(to: .finished)
             } else {
-                setPillBadge(id: "integration_claude", badge: .finished)
+                setPillBadge(id: taskId, badge: .finished)
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 5.2) {
-                state.updateTask(id: "integration_claude", state: .idle)
-                self.clearPillBadge(id: "integration_claude")
+                state.updateTask(id: taskId, state: .idle)
+                self.clearPillBadge(id: taskId)
             }
 
         case "StopFailure":
-            state.updateTask(id: "integration_claude", state: .error)
+            state.updateTask(id: taskId, state: .error)
             SoundEngine.shared.play("error")
             if focused {
                 expandIfNeeded(to: .error)
             } else {
-                setPillBadge(id: "integration_claude", badge: .error)
+                setPillBadge(id: taskId, badge: .error)
             }
 
         case "SessionEnd":
+            // Same reasoning as SessionStart: a child ending is not the session ending.
+            if taskId.hasPrefix("hermes_") && !taskId.hasPrefix("hermes_bot_") { break }
             activeSessionId = nil
-            state.updateTask(id: "integration_claude", state: .idle)
+            state.updateTask(id: taskId, state: .idle)
             clearSession()
 
         case "SubagentStart":
-            appendStep(id: "integration_claude", step: "+ subagent")
+            // One pill per live subagent. The grid shows the 4 most recent, so
+            // when a fifth spawns the oldest finished one is evicted first —
+            // dropping a pill nobody is watching beats hiding the newest work.
+            guard let sub = payload["subagent_id"] as? String, !sub.isEmpty else {
+                appendStep(id: taskId, step: "+ subagent")
+                break
+            }
+            let pillId = AgentTask.hermesSubagentId(sub)
+            guard !state.tasks.contains(where: { $0.id == pillId }) else { break }
+            evictOldestSubagentIfFull()
+            let goal = payload["goal"] as? String ?? ""
+            let role = payload["role"] as? String ?? ""
+            state.addTask(AgentTask(
+                id: pillId,
+                name: String((goal.isEmpty ? "subagent" : goal).prefix(24)),
+                color: AgentTask.hermesColor(for: sub),
+                state: .working,
+                steps: [],
+                source: .claudeCode,
+                isIntegration: true
+            ))
+            nbLog("SubagentStart \(sub) [\(role)] \(goal.prefix(40))")
 
         case "SubagentStop":
-            appendStep(id: "integration_claude", step: "• subagent done")
+            guard let sub = payload["subagent_id"] as? String, !sub.isEmpty else {
+                appendStep(id: taskId, step: "• subagent done")
+                break
+            }
+            let pillId = AgentTask.hermesSubagentId(sub)
+            // Show the outcome on the pill for a moment before it disappears,
+            // otherwise a fast subagent flashes past with nothing readable.
+            if let summary = payload["summary"] as? String, !summary.isEmpty {
+                appendStep(id: pillId, step: String(summary.prefix(60)))
+            }
+            let ok = (payload["status"] as? String ?? "completed") == "completed"
+            state.updateTask(id: pillId, state: ok ? .finished : .error)
+            SoundEngine.shared.play(ok ? "finish" : "error")
+            nbLog("SubagentStop \(sub) ok=\(ok)")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
+                AppState.shared.removeTask(id: pillId)
+            }
 
         default:
             break
         }
+    }
+
+    /// Keep at most `maxSubagentPills` subagent pills so the 4-slot grid always
+    /// has room for the main session plus the newest children. Finished ones go
+    /// first; if every pill is still running, the oldest is the one to lose.
+    @MainActor
+    private func evictOldestSubagentIfFull() {
+        let state = AppState.shared
+        let subagentPills = state.tasks.filter { $0.id.hasPrefix("hermes_") }
+        guard subagentPills.count >= Self.maxSubagentPills else { return }
+        let victim = subagentPills.first(where: { $0.state == .finished || $0.state == .idle })
+            ?? subagentPills.first
+        if let victim { state.removeTask(id: victim.id) }
     }
 
     // MARK: - Helpers
@@ -293,7 +373,10 @@ final class HookServer: @unchecked Sendable {
         let sessionId = payload["session_id"] as? String ?? "unknown"
         let cwd       = payload["cwd"]        as? String ?? ""
         let rawName   = URL(fileURLWithPath: cwd).lastPathComponent
-        let projectName = aliasProjectName(rawName.isEmpty ? "Session" : rawName)
+        // Gateway-driven turns run from the Hermes home, whose basename
+        // (".hermes") is noise as a project name — fall back to the agent.
+        let projectName = rawName.isEmpty || rawName.hasPrefix(".")
+            ? "Hermes" : aliasProjectName(rawName)
 
         let termProgram = payload["term_program"] as? String ?? ""
         let bundleId    = payload["bundle_id"]    as? String ?? ""
@@ -404,7 +487,7 @@ final class HookServer: @unchecked Sendable {
         guard let idx = state.tasks.firstIndex(where: { $0.id == "integration_claude" }) else { return }
         state.tasks[idx].steps = []
         state.tasks[idx].stepIndex = 0
-        state.tasks[idx].name = "VS Code"
+        state.tasks[idx].name = "Hermes"
         state.tasks[idx].pillBadge = nil
     }
 

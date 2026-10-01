@@ -1,5 +1,20 @@
 import SwiftUI
 
+/// Bring the Hermes desktop forward, launching it if needed. File-scope because
+/// both the overview pill and the detail view need it, and they are separate views.
+@MainActor
+func activateHermesDesktop() {
+    let bundleId = "com.nousresearch.hermes"
+    if let running = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == bundleId }) {
+        running.activate(options: .activateIgnoringOtherApps)
+        return
+    }
+    if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) {
+        NSWorkspace.shared.openApplication(at: url, configuration: .init(), completionHandler: nil)
+    }
+}
+
+
 // MARK: - Dispatch view content by IslandView
 
 struct IslandViewContent: View {
@@ -59,7 +74,7 @@ struct OverviewView: View {
                                     .lineLimit(1)
                                     .truncationMode(.tail)
                                     .layoutPriority(1)
-                                Text(agent.source == .claudeCode ? "Claude Code" : "n8n")
+                                Text(agent.source == .claudeCode ? "Hermes" : "n8n")
                                     .font(.system(size: 11))
                                     .foregroundColor(Color(hex: "#8E939C"))
                                     .lineLimit(1)
@@ -115,14 +130,13 @@ struct OverviewView: View {
 
     private func openAgentTarget(_ task: AgentTask?) {
         guard let task else { return }
+        // Every Hermes pill — the default bot, a secondary profile, or a live
+        // subagent — belongs to the Hermes desktop, not to an editor.
+        if task.id == "integration_claude" || task.id.hasPrefix("hermes_") {
+            activateHermesDesktop()
+            return
+        }
         switch task.id {
-        case "integration_claude":
-            let vscodeBundleId = "com.microsoft.VSCode"
-            if let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == vscodeBundleId }) {
-                app.activate(options: .activateIgnoringOtherApps)
-            } else {
-                NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/Visual Studio Code.app"))
-            }
         case "integration_resend":
             NSWorkspace.shared.open(URL(string: "https://resend.com/emails")!)
         case "integration_vercel":
@@ -229,7 +243,7 @@ struct QuestionView: View {
         ZStack {
             CardBackground(wash: .cyan)
             VStack(alignment: .leading, spacing: 5) {
-                AgentWho(task: state.focusTask, label: "Claude Code is asking a question")
+                AgentWho(task: state.focusTask, label: "Hermes is asking a question")
                 Text("Which search engine to use?")
                     .font(.system(size: 15, weight: .semibold))
                 HStack(spacing: 8) {
@@ -283,7 +297,7 @@ struct FinishedView: View {
         ZStack {
             CardBackground(wash: .green)
             VStack(alignment: .leading, spacing: 5) {
-                AgentWho(task: state.focusTask, label: "Claude Code finished")
+                AgentWho(task: state.focusTask, label: "Hermes finished")
                 Text(state.focusTask?.steps.last ?? "Session finished")
                     .font(.system(size: 15, weight: .semibold))
                 HStack(spacing: 8) {
@@ -853,9 +867,9 @@ struct SearchingView: View {
 
     var label: String {
         switch state.promptContext {
-        case .window(_, let title, _): return "Claude is reading \(title)…"
-        case .file(let name, _): return "Claude is reading \(name)…"
-        case nil: return "Claude is searching…"
+        case .window(_, let title, _): return "Hermes is reading \(title)…"
+        case .file(let name, _): return "Hermes is reading \(name)…"
+        case nil: return "Hermes is working…"
         }
     }
 
@@ -956,8 +970,18 @@ struct IntegrationCardView: View {
     @ObservedObject private var appState = AppState.shared
 
     private var isConfigured: Bool {
+        // Hermes pills: wired when the bridge is registered in the Hermes config.
+        // A bot pill exists only because its profile directory does, so it is
+        // configured by construction.
+        if task.id.hasPrefix("hermes_") { return true }
+        if task.id == "integration_claude" {
+            let cfg = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".hermes/config.yaml")
+            guard let text = try? String(contentsOf: cfg, encoding: .utf8) else { return false }
+            return text.contains("coucou-bridge")
+        }
         switch task.id {
-        case "integration_claude":
+        case "__unused_claude_code__":
             #if APPSTORE
             // Sandboxed: can't read ~/.claude directly — check install flag set by HookServer
             return UserDefaults.standard.bool(forKey: "coucouHooksInstalled")
@@ -1083,7 +1107,7 @@ struct IntegrationCardView: View {
                         .foregroundColor(Color(hex: "#F5F6F8"))
                         .lineLimit(1).truncationMode(.tail)
                         .layoutPriority(1)
-                    Text("Claude Code")
+                    Text("Hermes")
                         .font(.system(size: 11))
                         .foregroundColor(Color(hex: "#8E939C"))
                         .lineLimit(1).truncationMode(.tail)
@@ -1114,10 +1138,10 @@ struct IntegrationCardView: View {
                     Circle()
                         .fill(Color(hex: task.color))
                         .frame(width: 7, height: 7)
-                    Text(task.id == "integration_claude" ? "VS Code" : task.name)
+                    Text(task.id == "integration_claude" ? "Hermes" : task.name)
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundColor(Color(hex: "#F5F6F8"))
-                    Text("Integration")
+                    Text(task.id.hasPrefix("hermes_") || task.id == "integration_claude" ? "Agent" : "Integration")
                         .font(.system(size: 11))
                         .foregroundColor(Color(hex: "#8E939C"))
                     Spacer(minLength: 2)
@@ -1133,7 +1157,9 @@ struct IntegrationCardView: View {
                     let dot = stripeErr != nil ? Color(hex: "#F4505E")
                             : isConfigured    ? Color(hex: "#22C55E")
                             :                   Color(hex: "#F4505E")
-                    let label = stripeErr ?? (isConfigured ? "Connected · loading…" : "Key not configured")
+                    let isHermes = task.id == "integration_claude" || task.id.hasPrefix("hermes_")
+                    let label = stripeErr ?? (isConfigured ? (isHermes ? "Connected" : "Connected · loading…")
+                                                           : (isHermes ? "Bridge not registered in ~/.hermes/config.yaml" : "Key not configured"))
                     Circle().fill(dot).frame(width: 5, height: 5)
                     Text(label)
                         .font(.system(size: 11))
@@ -1144,7 +1170,7 @@ struct IntegrationCardView: View {
 
                 HStack(spacing: 8) {
                     if task.id == "integration_claude" {
-                        Button("Open Visual Studio Code") { openVSCode() }
+                        Button("Open Hermes") { activateHermesDesktop() }
                             .font(.system(size: 11, weight: .medium))
                             .foregroundColor(Color(hex: task.color).opacity(0.7))
                             .buttonStyle(.plain)
@@ -2277,9 +2303,9 @@ struct AgentPill: View {
     let onTap: () -> Void
     @State private var isHovered = false
 
-    // VS Code pill always shows "VS Code" label regardless of active project name
+    // The main pill always shows "Hermes", regardless of the active project name
     private var displayName: String {
-        task.id == "integration_claude" ? "VS Code" : task.name
+        task.id == "integration_claude" ? "Hermes" : task.name
     }
 
     var body: some View {
@@ -2702,7 +2728,7 @@ struct SettingsIslandView: View {
     }
 
     private var apiConnected: Bool {
-        KeychainStore.shared.get("anthropic-api-key") != nil
+        KeychainStore.shared.get("hermes-api-key") != nil
     }
 
     var body: some View {
@@ -2751,7 +2777,7 @@ struct SettingsIslandView: View {
 
                 // Connection status
                 HStack(spacing: 14) {
-                    StatusBadge(label: "Claude Code", ok: claudeConnected)
+                    StatusBadge(label: "Hermes", ok: claudeConnected)
                     StatusBadge(label: "API", ok: apiConnected)
                     Spacer()
                     Button("Settings…") {
