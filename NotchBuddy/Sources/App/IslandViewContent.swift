@@ -725,6 +725,7 @@ struct PromptView: View {
     @ObservedObject var state: AppState
     @State private var text: String = ""
     @FocusState private var focused: Bool
+    @ObservedObject private var voice = VoiceEngine.shared
 
     var body: some View {
         ZStack(alignment: .leading) {
@@ -775,6 +776,34 @@ struct PromptView: View {
                         .focused($focused)
                         .onSubmit { sendMessage() }
 
+                    // Voice. The speaker toggles whether replies are spoken
+                    // (Hermes' own voice, via the local TTS sidecar); the mic
+                    // dictates on-device and sends when you tap it again.
+                    Button(action: toggleVoice) {
+                        Image(systemName: voice.voiceEnabled ? "speaker.wave.2.fill" : "speaker.slash")
+                            .font(.system(size: 11))
+                            .foregroundColor(Color(hex: voice.voiceEnabled ? "#F5F6F8" : "#6B7079"))
+                    }
+                    .buttonStyle(.plain)
+                    .help(voice.voiceEnabled ? "Spoken replies on" : "Spoken replies off")
+
+                    // Hands-free conversation, the equivalent of Hermes' /voice on.
+                    Button(action: toggleConversation) {
+                        Image(systemName: voice.conversationMode ? "waveform.circle.fill" : "waveform.circle")
+                            .font(.system(size: 13))
+                            .foregroundColor(Color(hex: voice.conversationMode ? "#22C55E" : "#6B7079"))
+                    }
+                    .buttonStyle(.plain)
+                    .help(voice.conversationMode ? "Voice conversation on — tap to stop" : "Start voice conversation")
+
+                    Button(action: toggleDictation) {
+                        Image(systemName: voice.isListening ? "mic.fill" : "mic")
+                            .font(.system(size: 11))
+                            .foregroundColor(Color(hex: voice.isListening ? "#F4505E" : "#6B7079"))
+                    }
+                    .buttonStyle(.plain)
+                    .help(voice.isListening ? "Listening — tap to send" : "Dictate")
+
                     Button(action: sendMessage) {
                         Image(systemName: "arrow.up")
                             .font(.system(size: 11, weight: .semibold))
@@ -795,6 +824,51 @@ struct PromptView: View {
         }
         .padding(.bottom, 10)
         .onAppear { focused = true }
+    }
+
+    /// Start or stop the hands-free loop. While it runs the mic re-arms itself
+    /// after every spoken reply, so the only tap needed is this one.
+    private func toggleConversation() {
+        if voice.conversationMode {
+            voice.stopConversation()
+            return
+        }
+        voice.requestPermissions { granted in
+            guard granted else {
+                AppState.shared.noteMessage = "Microphone or speech recognition not allowed."
+                AppState.shared.view = .note
+                return
+            }
+            voice.startConversation { transcript in
+                text = transcript
+                sendMessage()
+            }
+        }
+    }
+
+    private func toggleVoice() {
+        voice.voiceEnabled.toggle()
+        if !voice.voiceEnabled { voice.stopSpeaking() }
+    }
+
+    /// Tap to dictate, tap again to send. The permission prompts appear here,
+    /// on a deliberate tap, rather than at launch.
+    private func toggleDictation() {
+        if voice.isListening {
+            voice.stopListening()
+            return
+        }
+        voice.requestPermissions { granted in
+            guard granted else {
+                AppState.shared.noteMessage = "Microphone or speech recognition not allowed."
+                AppState.shared.view = .note
+                return
+            }
+            voice.startListening { transcript in
+                text = transcript
+                sendMessage()
+            }
+        }
     }
 
     private func sendMessage() {

@@ -298,7 +298,10 @@ final class ClaudeService {
         }
 
         conversationMessages.append(["role": "assistant", "content": text])
-        state.chatHistory.append(ChatMessage(role: .assistant, content: text.trimmingCharacters(in: .whitespacesAndNewlines)))
+        let reply = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        state.chatHistory.append(ChatMessage(role: .assistant, content: reply))
+        // No-op unless the user turned voice on; never blocks the reply appearing.
+        VoiceEngine.shared.speak(reply)
 
         state.stateOverride = nil
         state.view = .prompt

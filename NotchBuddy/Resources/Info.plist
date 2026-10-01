@@ -30,5 +30,9 @@
 	<true/>
 	<key>NSSupportsAutomaticGraphicsSwitching</key>
 	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Coucou uses the microphone so you can dictate to Hermes from the notch.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Coucou transcribes your dictation on-device to send it to Hermes.</string>
 </dict>
 </plist>
