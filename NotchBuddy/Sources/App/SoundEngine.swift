@@ -80,9 +80,15 @@ final class VoiceEngine: NSObject, ObservableObject {
     /// Hands-free loop: listen -> send -> speak -> listen again.
     @Published var conversationMode: Bool = false
 
-    /// How long a pause ends your turn. Short enough not to feel sluggish,
-    /// long enough to survive thinking mid-sentence.
+    /// How long a pause ends your turn, once you have actually started talking.
+    /// Short enough not to feel sluggish, long enough to think mid-sentence.
     private let silenceEndsTurn: TimeInterval = 1.8
+    /// Much longer before the first word: the old code armed the 1.8s timer the
+    /// moment the mic opened, so taking a breath before speaking ended the turn
+    /// empty — and an empty turn used to kill the whole conversation.
+    private let silenceBeforeFirstWord: TimeInterval = 10
+    /// True once this turn has heard anything at all.
+    private var heardSomething = false
     private var silenceTimer: Timer?
     private var sendTranscript: ((String) -> Void)?
 
@@ -231,21 +237,42 @@ final class VoiceEngine: NSObject, ObservableObject {
                     let heard = result.bestTranscription.formattedString
                     if heard != self.partialTranscript {
                         self.partialTranscript = heard
+                        self.heardSomething = true
                         // Still talking: push the end of the turn further out.
                         self.armSilenceTimer()
                     }
                     if result.isFinal {
-                        let final = self.partialTranscript
-                        self.cleanupListening()
-                        if !final.isEmpty { onFinal(final) }
+                        self.finishTurn(self.partialTranscript, reason: "final", onFinal: onFinal)
                     }
-                } else if error != nil {
+                } else if let error {
                     // A transcript captured before the error is still worth sending.
-                    let final = self.partialTranscript
-                    self.cleanupListening()
-                    if !final.isEmpty { onFinal(final) }
+                    // macOS also ends a recognition task on its own after about a
+                    // minute, which arrives here as an error, not as isFinal.
+                    self.finishTurn(self.partialTranscript,
+                                    reason: "error: \(error.localizedDescription)",
+                                    onFinal: onFinal)
                 }
             }
+        }
+    }
+
+    /// End one turn. An empty one used to stop everything: nothing was sent, so
+    /// no reply arrived, so the player never finished, so the loop never
+    /// re-armed the mic. That is the "it switches itself off" symptom.
+    private func finishTurn(_ transcript: String, reason: String, onFinal: @escaping (String) -> Void) {
+        let text = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        vlog("turn ended (\(reason)) text=\(text.isEmpty ? "<empty>" : "\(text.count) chars")")
+        let wasConversation = conversationMode
+        cleanupListening()
+        if !text.isEmpty {
+            onFinal(text)
+            return
+        }
+        guard wasConversation else { return }
+        // Nothing said: just listen again rather than ending the conversation.
+        // A short delay keeps a failing recogniser from spinning.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            VoiceEngine.shared.resumeAfterSpeaking()
         }
     }
 
@@ -253,8 +280,13 @@ final class VoiceEngine: NSObject, ObservableObject {
     private func armSilenceTimer() {
         silenceTimer?.invalidate()
         guard conversationMode else { return }
-        silenceTimer = Timer.scheduledTimer(withTimeInterval: silenceEndsTurn, repeats: false) { _ in
-            Task { @MainActor in VoiceEngine.shared.stopListening() }
+        let wait = heardSomething ? silenceEndsTurn : silenceBeforeFirstWord
+        silenceTimer = Timer.scheduledTimer(withTimeInterval: wait, repeats: false) { _ in
+            Task { @MainActor in
+                let engine = VoiceEngine.shared
+                engine.vlog(engine.heardSomething ? "turn ended by pause" : "nothing heard, re-arming")
+                engine.stopListening()
+            }
         }
     }
 
@@ -283,6 +315,7 @@ final class VoiceEngine: NSObject, ObservableObject {
     /// overlapping a reply with the next question queues two runs at once.
     private func listenForTurn() {
         guard conversationMode, !isSpeaking else { return }
+        heardSomething = false
         startListening { [weak self] transcript in
             guard let self, self.conversationMode else { return }
             self.sendTranscript?(transcript)
