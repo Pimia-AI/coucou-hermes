@@ -9,6 +9,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Ignore SIGPIPE — prevents crash when nb-hook closes socket before we write response
         signal(SIGPIPE, SIG_IGN)
+        // The hook socket comes up FIRST, before anything that can block.
+        // Reading the Keychain can stall indefinitely: item ACLs are bound to the
+        // app's code identity, so a locally rebuilt (ad-hoc signed) Coucou is a
+        // different app to macOS, which then puts up an authorization dialog —
+        // invisible for an LSUIElement agent — and SecItemCopyMatching waits on a
+        // click that never comes. That left the app alive with no socket and no
+        // error anywhere. Agent events must not depend on any of that.
+        HookServer.shared.start()
         // Warm up Keychain cache on main thread BEFORE any poller or view touches it
         _ = KeychainStore.shared
         NSApp.setActivationPolicy(.accessory)

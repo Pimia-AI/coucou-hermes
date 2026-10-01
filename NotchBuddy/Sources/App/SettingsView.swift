@@ -4,7 +4,7 @@ import AppKit
 
 struct SettingsView: View {
     @ObservedObject private var state = AppState.shared
-    @State private var apiKey: String = KeychainStore.shared.get("hermes-api-key") ?? ""
+    @State private var apiKey: String = ""
     @State private var launchAtStartup: Bool = (SMAppService.mainApp.status == .enabled)
     @State private var statusMessage: String = ""
     @State private var showDiff: Bool = false
@@ -12,15 +12,15 @@ struct SettingsView: View {
     @State private var hookNeedsUpdate: Bool = HookServer.hooksNeedUpdate()
 
     // Integration keys
-    @State private var resendKey: String    = KeychainStore.shared.get("resend-api-key")  ?? ""
-    @State private var resendFrom: String   = KeychainStore.shared.get("resend-from")     ?? ""
-    @State private var n8nUrl: String       = KeychainStore.shared.get("n8n-url")         ?? ""
-    @State private var n8nKey: String       = KeychainStore.shared.get("n8n-api-key")     ?? ""
-    @State private var vercelToken: String  = KeychainStore.shared.get("vercel-token")    ?? ""
-    @State private var githubToken: String  = KeychainStore.shared.get("github-token")    ?? ""
-    @State private var stripeKey: String    = KeychainStore.shared.get("stripe-api-key")  ?? ""
-    @State private var calcomKey: String    = KeychainStore.shared.get("calcom-api-key")  ?? ""
-    @State private var notionKey: String    = KeychainStore.shared.get("notion-api-key")  ?? ""
+    @State private var resendKey: String = ""
+    @State private var resendFrom: String = ""
+    @State private var n8nUrl: String = ""
+    @State private var n8nKey: String = ""
+    @State private var vercelToken: String = ""
+    @State private var githubToken: String = ""
+    @State private var stripeKey: String = ""
+    @State private var calcomKey: String = ""
+    @State private var notionKey: String = ""
 
     // Hotkey
     @State private var hotkeyFlags: UInt    = AppState.shared.hotkeyFlags
@@ -47,7 +47,7 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 18) {
 
                 // MARK: API
-                GroupBox("Anthropic API") {
+                GroupBox("Hermes gateway") {
                     VStack(alignment: .leading, spacing: 8) {
                         SecureField("Hermes API_SERVER_KEY", text: $apiKey)
                             .textFieldStyle(.roundedBorder)
@@ -340,6 +340,7 @@ struct SettingsView: View {
             .padding(20)
         }
         .frame(width: 480, height: 720)
+        .onAppear { loadSecrets() }
     }
 
     // MARK: - Actions
@@ -529,6 +530,24 @@ struct SettingsView: View {
             }
         }.resume()
     }
+
+    /// Secrets are read here, not in the @State initialisers above: SwiftUI
+    /// evaluates those while building the Settings scene, before the app
+    /// delegate runs, and a Keychain item whose ACL does not match this
+    /// binary blocks there with a dialog no one can see. Loading on appear
+    /// ties any prompt to the user opening Settings.
+    private func loadSecrets() {
+        apiKey = KeychainStore.shared.get("hermes-api-key") ?? ""
+        resendKey = KeychainStore.shared.get("resend-api-key") ?? ""
+        resendFrom = KeychainStore.shared.get("resend-from") ?? ""
+        n8nUrl = KeychainStore.shared.get("n8n-url") ?? ""
+        n8nKey = KeychainStore.shared.get("n8n-api-key") ?? ""
+        vercelToken = KeychainStore.shared.get("vercel-token") ?? ""
+        githubToken = KeychainStore.shared.get("github-token") ?? ""
+        stripeKey = KeychainStore.shared.get("stripe-api-key") ?? ""
+        calcomKey = KeychainStore.shared.get("calcom-api-key") ?? ""
+        notionKey = KeychainStore.shared.get("notion-api-key") ?? ""
+    }
 }
 
 // MARK: - Integration filter row (reusable for Vercel / n8n)
@@ -644,4 +663,5 @@ struct ShortcutRecorderButton: View {
         ]
         return map[c] ?? "·"
     }
+
 }

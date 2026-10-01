@@ -46,7 +46,13 @@ final class HookServer: @unchecked Sendable {
 
     // MARK: - Start
 
+    private var started = false
+
     func start() {
+        // Called from both applicationDidFinishLaunching and setupIsland; a second
+        // server thread would just lose the bind and give up silently.
+        if started { return }
+        started = true
         // Ensure support directory exists (mode 0700 — not world-readable)
         let dir = Self.supportDir
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -83,10 +89,20 @@ final class HookServer: @unchecked Sendable {
         let bindRC = withUnsafePointer(to: &addr) { ptr in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
         }
-        guard bindRC == 0 else { close(fd); return }
+        guard bindRC == 0 else {
+            // Silence here is how an unusable Coucou looks: alive, island showing,
+            // and no hook events ever arriving. Say so.
+            NSLog("HookServer: bind failed on \(path) (errno \(errno)) — no hook events will be received")
+            close(fd)
+            return
+        }
         // Restrict socket to owner only
         chmod(path, 0o600)
-        guard Darwin.listen(fd, 32) == 0 else { close(fd); return }
+        guard Darwin.listen(fd, 32) == 0 else {
+            NSLog("HookServer: listen failed on \(path) (errno \(errno)) — no hook events will be received")
+            close(fd)
+            return
+        }
 
         while true {
             let clientFD = Darwin.accept(fd, nil, nil)

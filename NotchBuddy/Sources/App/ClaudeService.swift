@@ -72,16 +72,37 @@ final class KeychainStore: @unchecked Sendable {
         "notion-api-key",
     ]
 
+    /// Keys already looked up, so a missing one is not re-queried on every read.
+    private var probed: Set<String> = []
+
     private init() {
-        // Called once, on main thread (AppDelegate triggers shared at launch).
-        for key in Self.allKeys {
-            if let v = Keychain.load(key: key) { cache[key] = v }
-        }
+        // Deliberately empty. Reading the Keychain here hung the whole launch:
+        // SettingsView's @State initialisers call into this singleton, and SwiftUI
+        // evaluates them while building the Settings scene — before
+        // applicationDidFinishLaunching. An item whose ACL does not match the
+        // running binary makes SecItemCopyMatching put up an authorization dialog,
+        // and for an LSUIElement agent that dialog never reaches the user. The app
+        // stayed alive with no menu bar item, no island and no hook socket, with
+        // nothing logged anywhere to say why.
+        //
+        // Ad-hoc signed builds hit this constantly: the ACL is bound to the code
+        // identity, so every local rebuild is a different app to macOS.
+        //
+        // Reads are lazy instead. The first one happens when something actually
+        // needs a secret — sending a chat, opening Settings — by which point the
+        // app is up and any dialog is attached to something the user just did.
     }
 
-    /// Thread-safe read — never touches the Keychain.
+    /// Thread-safe read. Loads from the Keychain on first use, then caches.
     func get(_ key: String) -> String? {
-        lock.withLock { cache[key] }
+        lock.withLock {
+            if let cached = cache[key] { return cached }
+            if probed.contains(key) { return nil }
+            probed.insert(key)
+            let value = Keychain.load(key: key)
+            if let value { cache[key] = value }
+            return value
+        }
     }
 
     /// Updates cache + persists to Keychain.
