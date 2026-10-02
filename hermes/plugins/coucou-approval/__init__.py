@@ -86,6 +86,10 @@ def _present(request):
     }
 
     wait = min(float(request.timeout_seconds or MAX_WAIT), MAX_WAIT)
+    # Tell Coucou how long this request is actually good for. Without it the
+    # island keeps the dialog up for its own 115s default, so a click after the
+    # host already gave up looks accepted but decides nothing.
+    payload["timeout_seconds"] = wait
     try:
         decision = _ask_coucou(payload, wait)
     except CoucouUnavailable:

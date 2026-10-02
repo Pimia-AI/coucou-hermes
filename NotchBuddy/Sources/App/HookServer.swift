@@ -435,7 +435,12 @@ final class HookServer: @unchecked Sendable {
         expandIfNeeded(to: .approval)
 
         let captured = fd
-        DispatchQueue.main.asyncAfter(deadline: .now() + 115) { [weak self] in
+        // The requester says how long it will wait. Claude Code's hook allows
+        // 120s and sends nothing, so 115 stays the default; Hermes sends its
+        // approvals.timeout, which may be much shorter. Outliving the requester
+        // means a click that looks accepted but decides nothing.
+        let window = (payload["timeout_seconds"] as? Double).map { max(5, min($0 - 2, 115)) } ?? 115
+        DispatchQueue.main.asyncAfter(deadline: .now() + window) { [weak self] in
             guard let self, self.pendingApprovalFD == captured else { return }
             // "ask" → nb-hook outputs nothing → Claude Code re-asks rather than denying
             self.sendApprovalDecision("ask")
