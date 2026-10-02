@@ -54,6 +54,21 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("coucou-tts")
 
 
+# A path is read slash by slash and its leading components carry no meaning out
+# loud: "/Volumes/data512/coucou-hermes/NotchBuddy/Sources/App/HookServer.swift"
+# is nine spoken fragments to say one file name. Hermes\' normalizer leaves the
+# path intact (and renders "/" as "per", which is not even Spanish), so trim to
+# the last component here.
+_PATH_RE = re.compile(r"(?<![\w.])(~?/[\w.\-]+(?:/[\w.\-]+){2,})")
+
+
+def shorten_paths(text: str) -> str:
+    """Speak only the last component of a long path, keeping short ones intact."""
+    def last(match: "re.Match[str]") -> str:
+        return match.group(1).rstrip("/").rsplit("/", 1)[-1] or match.group(1)
+    return _PATH_RE.sub(last, text)
+
+
 def configured(key: str, fallback: str) -> str:
     """Read tts.edge.<key> without a YAML dependency — it is a fixed two-level path."""
     try:
@@ -79,8 +94,10 @@ async def speak(request):
     if not raw:
         return web.json_response({"error": "empty text"}, status=400)
 
-    # Spoken script, not the literal reply.
-    text = prepare_spoken_text(raw, max_chars=MAX_CHARS) if prepare_spoken_text else raw[:MAX_CHARS]
+    # Paths are trimmed BEFORE Hermes' normalizer runs: it rewrites "/" as "per"
+    # and splits the extension off, leaving nothing a path regex can match.
+    text = shorten_paths(raw)
+    text = prepare_spoken_text(text, max_chars=MAX_CHARS) if prepare_spoken_text else text[:MAX_CHARS]
     if not text.strip():
         # Everything was code or links: nothing worth reading aloud.
         return web.json_response({"error": "nothing speakable"}, status=204)

@@ -290,11 +290,17 @@ final class ClaudeService {
         var reply = ""
         var eventName = ""
         var data = ""
+        var lineCount = 0
+        var frameCount = 0
+        VoiceEngine.shared.vlog("stream: connected \(http.statusCode)")
 
         // SSE frames: optional `event:` line, one or more `data:` lines, blank line.
         for try await line in bytes.lines {
+            lineCount += 1
+            if lineCount <= 3 { VoiceEngine.shared.vlog("stream line \(lineCount): \(line.prefix(60))") }
             if line.isEmpty {
                 if !data.isEmpty {
+                    frameCount += 1
                     await handleFrame(event: eventName, json: data, key: key,
                                       reply: &reply, onContent: onContent)
                 }
@@ -311,6 +317,7 @@ final class ClaudeService {
             await handleFrame(event: eventName, json: data, key: key,
                               reply: &reply, onContent: onContent)
         }
+        VoiceEngine.shared.vlog("stream: \(lineCount) lines, \(frameCount) frames, \(reply.count) chars")
         return reply
     }
 
