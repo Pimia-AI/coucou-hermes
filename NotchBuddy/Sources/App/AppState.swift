@@ -218,6 +218,10 @@ final class AppState: ObservableObject {
 
     // Pending approval request from Claude Code hook
     @Published var pendingApproval: ApprovalInfo? = nil
+    /// Set while a gateway approval is on screen. Gateway approvals arrive on the
+    /// chat SSE stream and are answered with an HTTP POST, not by writing to the
+    /// hook socket, so the buttons need somewhere else to send the decision.
+    var gatewayApprovalHandler: ((String) -> Void)? = nil
 
     // MARK: - Init (loads persisted settings)
 
@@ -489,5 +493,7 @@ enum ChatRole { case user, assistant }
 struct ChatMessage: Identifiable {
     let id = UUID()
     let role: ChatRole
-    let content: String
+    /// Mutable so a streamed reply grows in place; replacing the element would
+    /// mint a new id and make SwiftUI treat each chunk as a new row.
+    var content: String
 }

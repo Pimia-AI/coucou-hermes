@@ -183,9 +183,32 @@ final class ClaudeService {
         ]
 
         do {
-            let data = try await callAPI(body: body, key: key)
-            await handleChatResult(data, state: state)
+            // Append an empty assistant message and grow it as deltas arrive.
+            state.chatHistory.append(ChatMessage(role: .assistant, content: ""))
+            let index = state.chatHistory.count - 1
+            state.stateOverride = nil
+            state.view = .prompt
+
+            let reply = try await streamCompletion(body: body, key: key) { chunk in
+                guard index < state.chatHistory.count else { return }
+                state.chatHistory[index].content += chunk
+            }
+
+            let clean = reply.trimmingCharacters(in: .whitespacesAndNewlines)
+            if clean.isEmpty {
+                state.chatHistory.remove(at: index)
+                await showError("No reply from Hermes.", state: state)
+                conversationMessages.removeLast()
+                return
+            }
+            state.chatHistory[index].content = clean
+            conversationMessages.append(["role": "assistant", "content": clean])
+            VoiceEngine.shared.speak(clean)
+            NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.happy)
         } catch {
+            if let last = state.chatHistory.last, last.role == .assistant, last.content.isEmpty {
+                state.chatHistory.removeLast()
+            }
             conversationMessages.removeLast()
             await showError(friendlyError(error), state: state)
         }
@@ -218,10 +241,153 @@ final class ClaudeService {
         ]
 
         do {
-            let result = try await callAPI(body: body, key: key)
-            await handleResult(result, state: state)
+            // Streamed too: a structured search can trip the approval gate just
+            // as easily, and on the non-streaming path that request has nowhere
+            // to go. The text is only used once complete.
+            let text = try await streamCompletion(body: body, key: key) { _ in }
+            await handleResult(text, state: state)
         } catch {
             await showError(friendlyError(error), state: state)
+        }
+    }
+
+    // MARK: - Streaming
+    //
+    // The chat streams for one reason beyond the nicer typing effect: a
+    // dangerous-command approval only reaches the caller as an `approval.request`
+    // SSE event. With `stream: false` the gateway has no channel to ask on, so
+    // the request sits unanswered until it expires — and Hermes' contract is that
+    // silence is not consent, so the action is denied. A plugin approval
+    // transport does not help: that surface is CLI-only, and the gateway
+    // resolves approvals through `_await_gateway_decision` instead.
+
+    private let runsURL = URL(string: "http://127.0.0.1:8642/v1/runs")!
+
+    /// Run one streamed completion. `onContent` receives each text delta.
+    /// Returns the full reply once the stream ends.
+    private func streamCompletion(body: [String: Any], key: String,
+                                  onContent: @escaping (String) -> Void) async throws -> String {
+        var streamed = body
+        streamed["stream"] = true
+
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        request.setValue("text/event-stream", forHTTPHeaderField: "accept")
+        request.httpBody = try JSONSerialization.data(withJSONObject: streamed)
+        // No overall timeout: a turn can legitimately sit waiting for the user
+        // to answer an approval. The per-read timeout still applies.
+        request.timeoutInterval = 3600
+
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            throw NSError(domain: "Hermes", code: status,
+                          userInfo: [NSLocalizedDescriptionKey: "gateway returned \(status)"])
+        }
+
+        var reply = ""
+        var eventName = ""
+        var data = ""
+
+        // SSE frames: optional `event:` line, one or more `data:` lines, blank line.
+        for try await line in bytes.lines {
+            if line.isEmpty {
+                if !data.isEmpty {
+                    await handleFrame(event: eventName, json: data, key: key,
+                                      reply: &reply, onContent: onContent)
+                }
+                eventName = ""; data = ""
+                continue
+            }
+            if line.hasPrefix("event:") {
+                eventName = line.dropFirst(6).trimmingCharacters(in: .whitespaces)
+            } else if line.hasPrefix("data:") {
+                data += line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+            }
+        }
+        if !data.isEmpty {
+            await handleFrame(event: eventName, json: data, key: key,
+                              reply: &reply, onContent: onContent)
+        }
+        return reply
+    }
+
+    private func handleFrame(event: String, json: String, key: String,
+                             reply: inout String, onContent: @escaping (String) -> Void) async {
+        if json == "[DONE]" { return }
+        guard let parsed = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any] else { return }
+
+        if event == "approval.request" {
+            await presentApproval(parsed, key: key)
+            return
+        }
+        // Ignore hermes.status / hermes.tool.progress: the pills already show that.
+        guard event.isEmpty else { return }
+
+        if let choices = parsed["choices"] as? [[String: Any]],
+           let delta = choices.first?["delta"] as? [String: Any],
+           let chunk = delta["content"] as? String, !chunk.isEmpty {
+            reply += chunk
+            onContent(chunk)
+        }
+    }
+
+    // MARK: - Gateway approvals
+
+    /// Put the request on the island and wait for a button. Hermes holds the run
+    /// until the decision is posted, so blocking here is what we want.
+    private func presentApproval(_ event: [String: Any], key: String) async {
+        let state = AppState.shared
+        let runId = event["run_id"] as? String ?? ""
+        let requestId = event["request_id"] as? String
+        let command = event["command"] as? String ?? event["description"] as? String ?? "command"
+        let allowed = Set(event["choices"] as? [String] ?? ["once", "deny"])
+
+        let choice: String = await withCheckedContinuation { continuation in
+            var resumed = false
+            state.gatewayApprovalHandler = { decision in
+                guard !resumed else { return }
+                resumed = true
+                // Coucou's buttons speak allow/always/deny; Hermes wants
+                // once/session/always/deny, and only the ones it offered.
+                let mapped: String
+                switch decision {
+                case "allow":  mapped = "once"
+                case "always": mapped = allowed.contains("always") ? "always"
+                                      : (allowed.contains("session") ? "session" : "once")
+                default:       mapped = "deny"
+                }
+                continuation.resume(returning: mapped)
+            }
+            state.pendingApproval = ApprovalInfo(sessionId: runId, tool: "Hermes", command: command)
+            state.isPinned = true
+            state.stateOverride = .approval
+            state.view = .approval
+            SoundEngine.shared.play("approval")
+        }
+
+        state.gatewayApprovalHandler = nil
+        await postApproval(runId: runId, requestId: requestId, choice: choice, key: key)
+    }
+
+    private func postApproval(runId: String, requestId: String?, choice: String, key: String) async {
+        guard !runId.isEmpty else { return }
+        var request = URLRequest(url: runsURL.appendingPathComponent(runId).appendingPathComponent("approval"))
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        var payload: [String: Any] = ["choice": choice]
+        if let requestId, !requestId.isEmpty { payload["request_id"] = requestId }
+        request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+        request.timeoutInterval = 30
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if status != 200 { NSLog("Hermes: approval POST returned \(status)") }
+        } catch {
+            NSLog("Hermes: approval POST failed: \(error.localizedDescription)")
         }
     }
 
@@ -310,9 +476,10 @@ final class ClaudeService {
 
     // MARK: - Structured result handler
 
-    private func handleResult(_ data: Data, state: AppState) async {
-        guard let text = assistantText(data) else {
-            await showError("Unexpected gateway response.", state: state)
+    private func handleResult(_ raw: String, state: AppState) async {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.isEmpty {
+            await showError("No reply from Hermes.", state: state)
             return
         }
 

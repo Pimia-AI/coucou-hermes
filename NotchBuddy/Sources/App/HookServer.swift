@@ -445,6 +445,16 @@ final class HookServer: @unchecked Sendable {
     /// Called by ApprovalView buttons. Writes the decision to the waiting nb-hook and cleans up.
     @MainActor
     func sendApprovalDecision(_ decision: String) {
+        // A gateway approval has no socket waiting on the other end: it came in
+        // on the chat stream and is answered over HTTP. Hand it back there.
+        if let handler = AppState.shared.gatewayApprovalHandler {
+            AppState.shared.gatewayApprovalHandler = nil
+            handler(decision)
+            let state = AppState.shared
+            state.pendingApproval = nil
+            state.isPinned = false
+            return
+        }
         let fd = pendingApprovalFD
         pendingApprovalFD = -1
 
