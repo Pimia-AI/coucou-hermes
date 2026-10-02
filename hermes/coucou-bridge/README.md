@@ -139,3 +139,30 @@ Other changes that came with it:
 The gateway must be running or the chat shows
 "Hermes gateway not reachable". To keep it up across reboots:
 `hermes gateway install`.
+
+---
+
+## Approvals: which ones reach the island
+
+Two detectors flag a command, and `approvals.mode` decides who answers.
+
+| `approvals.mode` | Pattern-flagged (`rm -rf`, …) | Content-flagged (tirith) |
+|---|---|---|
+| `smart` | a guardian LLM decides alone | asks on the island |
+| `manual` | asks on the island | asks on the island |
+| `off` | nothing is flagged | nothing is flagged |
+
+`smart` is Hermes' default and it never asks about pattern hits it judges safe:
+`rm -rf <path>` ran with no prompt at all. `manual` closes that, at the cost of
+more interruptions.
+
+The cost of `manual` worth knowing: **if Coucou is not running, a flagged
+command waits the full `approvals.timeout` (300s by default) and is then
+denied.** The transport fails, `transport_fallback: builtin` hands it to a CLI
+prompt, and a gateway running under launchd has no terminal to prompt on.
+Lower `approvals.timeout` if that wait is worse than the denial.
+
+What does NOT reach the island, regardless of mode: anything on a session whose
+platform is in `_UNATTENDED_APPROVAL_PLATFORMS` (webhook, msgraph_webhook,
+api_server) when that unattended context actually applies — there the
+`approvals.unattended_mode` config decides, default deny, with nobody asked.
