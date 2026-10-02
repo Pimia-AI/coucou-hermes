@@ -290,34 +290,27 @@ final class ClaudeService {
         var reply = ""
         var eventName = ""
         var data = ""
-        var lineCount = 0
         var frameCount = 0
-        VoiceEngine.shared.vlog("stream: connected \(http.statusCode)")
 
-        // SSE frames: optional `event:` line, one or more `data:` lines, blank line.
+        // One JSON object per `data:` line, dispatched as it arrives rather than
+        // on the blank line that ends an SSE frame: AsyncLineSequence does not
+        // yield those blank lines, so waiting for one meant 15 lines in and not
+        // a single frame handled. An `event:` line labels the frame right after
+        // it, so the name is cleared once that frame is consumed.
         for try await line in bytes.lines {
-            lineCount += 1
-            if lineCount <= 3 { VoiceEngine.shared.vlog("stream line \(lineCount): \(line.prefix(60))") }
-            if line.isEmpty {
-                if !data.isEmpty {
-                    frameCount += 1
-                    await handleFrame(event: eventName, json: data, key: key,
-                                      reply: &reply, onContent: onContent)
-                }
-                eventName = ""; data = ""
-                continue
-            }
             if line.hasPrefix("event:") {
                 eventName = line.dropFirst(6).trimmingCharacters(in: .whitespaces)
-            } else if line.hasPrefix("data:") {
-                data += line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+                continue
             }
-        }
-        if !data.isEmpty {
+            guard line.hasPrefix("data:") else { continue }
+            data = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+            guard !data.isEmpty else { continue }
+            frameCount += 1
             await handleFrame(event: eventName, json: data, key: key,
                               reply: &reply, onContent: onContent)
+            eventName = ""
         }
-        VoiceEngine.shared.vlog("stream: \(lineCount) lines, \(frameCount) frames, \(reply.count) chars")
+        VoiceEngine.shared.vlog("stream: \(frameCount) frames, \(reply.count) chars")
         return reply
     }
 

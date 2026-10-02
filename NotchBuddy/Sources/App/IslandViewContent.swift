@@ -1,5 +1,31 @@
 import SwiftUI
 
+/// Whether the shell-hook bridge is registered in the Hermes config.
+///
+/// Cached deliberately: this is read from `isConfigured`, a computed property
+/// evaluated inside a SwiftUI body, so the uncached version hit the disk on
+/// every render — dozens of synchronous reads a second while the island was
+/// animating open, which is exactly what made it stutter. The answer only
+/// changes when the user edits their Hermes config, so a periodic refresh is
+/// plenty.
+@MainActor
+enum HermesBridgeStatus {
+    private static var cached: Bool?
+    private static var checkedAt: Date = .distantPast
+    private static let ttl: TimeInterval = 30
+
+    static var isWired: Bool {
+        if let cached, Date().timeIntervalSince(checkedAt) < ttl { return cached }
+        let cfg = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".hermes/config.yaml")
+        let wired = ((try? String(contentsOf: cfg, encoding: .utf8)) ?? "").contains("coucou-bridge")
+        cached = wired
+        checkedAt = Date()
+        return wired
+    }
+}
+
+
 /// Bring the Hermes desktop forward, launching it if needed. File-scope because
 /// both the overview pill and the detail view need it, and they are separate views.
 @MainActor
@@ -1048,12 +1074,7 @@ struct IntegrationCardView: View {
         // A bot pill exists only because its profile directory does, so it is
         // configured by construction.
         if task.id.hasPrefix("hermes_") { return true }
-        if task.id == "integration_claude" {
-            let cfg = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(".hermes/config.yaml")
-            guard let text = try? String(contentsOf: cfg, encoding: .utf8) else { return false }
-            return text.contains("coucou-bridge")
-        }
+        if task.id == "integration_claude" { return HermesBridgeStatus.isWired }
         switch task.id {
         case "__unused_claude_code__":
             #if APPSTORE
